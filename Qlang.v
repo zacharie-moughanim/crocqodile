@@ -1,7 +1,7 @@
 From Stdlib Require Import Utf8.
 From Stdlib Require Import Lists.List Nat Bool.
 Import ListNotations.
-Require Import Autosubst.Autosubst.
+Require Export Autosubst.Autosubst.
 
 (** The Q language *)
 
@@ -12,6 +12,7 @@ Inductive Q : Type :=
   | ConsW (hd : Q) (tl : Q) : Q
   | Abs (body : {bind Q}) : Q
   | App (f : Q) (arg : Q) : Q
+  | IfLetter (cond : Q) (thenBody : Q) (elseBody : Q) : Q
 .
 
 (* For autosubst substitution etc *)
@@ -34,7 +35,8 @@ Notation "f x .. y" := (App .. (App f x) .. y)
 Definition Qfun := Abs.
 Definition Q0  := (Letter false).
 Definition Q1  := (Letter true).
-Infix ":Q:" := ConsW (in custom Qlang at level 80).
+Infix ":Q:" := ConsW (at level 199) : Qlang_scope.
+Notation "'Qif' x 'Qthen' y 'Qelse' z" := (IfLetter x y z) (at level 90) : Qlang_scope.
 (* Notation "x <= y" := (BLe x y) (in custom Qlang at level 70, no associativity).
 Notation "x = y"  := (BEq x y) (in custom Qlang at level 70, no associativity).
 Notation "x && y" := (BAnd x y) (in custom Qlang at level 80, left associativity).
@@ -43,7 +45,7 @@ Notation "'~' b"  := (BNot b) (in custom Qlang at level 75, right associativity)
 
 Open Scope Qlang_scope.
 
-Check <{ (Qfun (Var 0)) Q0 }>. 
+Check <{ (Qfun (Qif (Var 0) Qthen (Var 0) :Q: ε Qelse ε)) Q0 }>.   
 
 (** Types for the Q language *)
 
@@ -93,6 +95,9 @@ Inductive Qtyping : typenv → Q → Qtype → Prop :=
     (typenv_enter_abs Γ α) ⊢ body ⦙ β → Γ ⊢ Abs body ⦙ (α →T β)
   | TJApp (Γ : typenv) (α β : Qtype) (f : Q) (arg : Q) :
     Γ ⊢ f ⦙ (α →T β) → Γ ⊢ arg ⦙ α → Γ ⊢ App f arg ⦙ β
+  | TJIf (Γ : typenv) (α : Qtype) (cond thenBody elseBody : Q) :
+    Γ ⊢ cond ⦙ TLetter → Γ ⊢ thenBody ⦙ α → Γ ⊢ elseBody ⦙ α →
+    Γ ⊢ (Qif cond Qthen thenBody Qelse elseBody) ⦙ α
 where "gamma '⊢' t '⦙' tau" := (Qtyping gamma t tau).
 
 (* Check (fun (gamma : typenv) (t : Q) (tau : Qtype) => ( gamma ⊢ t ⦙ tau )). *)
@@ -113,7 +118,7 @@ Definition is_value (term : Q) :=
 
 Lemma is_value_refl : ∀ (t : Q), reflect (value t) (is_value t).
 Proof.
-  destruct t as [x | w | b | hd tl | body | f arg];
+  destruct t as [x | w | b | hd tl | body | f arg | cond thenBody elseBody];
   simpl; constructor; try constructor.
   all: intro H;
     inversion H.
@@ -129,6 +134,9 @@ Inductive QContext : Type :=
   | CConsWTl (hd : Q) (Ctl : QContext) : QContext
   | CAppF (Cf : QContext) (arg : Q) : QContext
   | CAppArg (f : Q) (Carg : QContext) : QContext
+  | CIfCond (CCond : QContext) (thenBody elseBody : Q) : QContext
+  | CIfThen (cond : Q) (CThen : QContext) (elseBody : Q) : QContext
+  | CIfElse (cond : Q) (thenBody : Q) (CElse : QContext) : QContext
 .
 
 Notation "□" := CHole.
@@ -149,6 +157,18 @@ Inductive QEvalContext : QContext → Prop :=
     value f →
     QEvalContext Carg →
     QEvalContext (CAppArg f Carg)
+  | EIfCond (CCond : QContext) (thenBody elseBody : Q) :
+    QEvalContext CCond →
+    QEvalContext (CIfCond CCond thenBody elseBody)
+  | EIfThen (cond : Q) (CThen : QContext) (elseBody : Q) :
+    value cond →
+    QEvalContext CThen →
+    QEvalContext (CIfThen cond CThen elseBody)
+  | EIfElse (cond : Q) (thenBody : Q) (CElse : QContext) :
+    value cond →
+    value thenBody →
+    QEvalContext CElse →
+    QEvalContext (CIfElse cond thenBody CElse)
 .
 
 Reserved Notation "C '⋄' u" (at level 50).
@@ -159,6 +179,9 @@ Fixpoint plug (C : QContext) (u : Q) : Q :=
   | CConsWTl hd Ctl => ConsW hd (Ctl ⋄ u)
   | CAppF Cf arg => App (Cf ⋄ u) arg
   | CAppArg f Carg => App f (Carg ⋄ u)
+  | CIfCond CCond thenBody elseBody => IfLetter (CCond ⋄ u) thenBody elseBody
+  | CIfThen cond CThen elseBody => IfLetter cond (CThen ⋄ u) elseBody
+  | CIfElse cond thenBody CElse => IfLetter cond thenBody (CElse ⋄ u)
   end
 where "C '⋄' u" := (plug C u).
 
@@ -169,8 +192,9 @@ Lemma plug_eq_var :
   C = □ ∧ t = Var x.
 Proof.
   intros E t x eq.
-  destruct E as [|Chd tl|hd Ctl|Cf arg|f Carg].
-  2, 3, 4, 5: simpl in eq; discriminate eq.
+  destruct E as [|Chd tl|hd Ctl|Cf arg|f Carg|
+    Ccond thenBody elseBody|cond CThen elseBody|cond thenBody CElse].
+  2, 3, 4, 5, 6, 7, 8: simpl in eq; discriminate eq.
   simpl in eq; split; congruence.
 Qed.
 
@@ -181,8 +205,9 @@ Lemma plug_eq_word :
   C = □ ∧ t = Word w.
 Proof.
   intros E t x eq.
-  destruct E as [|Chd tl|hd Ctl|Cf arg|f Carg].
-  2, 3, 4, 5: simpl in eq; discriminate eq.
+  destruct E as [|Chd tl|hd Ctl|Cf arg|f Carg|
+    Ccond thenBody elseBody|cond CThen elseBody|cond thenBody CElse].
+  2, 3, 4, 5, 6, 7, 8: simpl in eq; discriminate eq.
   simpl in eq; split; congruence.
 Qed.
 
@@ -193,8 +218,9 @@ Lemma plug_eq_letter :
   C = □ ∧ t = Letter b.
 Proof.
   intros E t x eq.
-  destruct E as [|Chd tl|hd Ctl|Cf arg|f Carg].
-  2, 3, 4, 5: simpl in eq; discriminate eq.
+  destruct E as [|Chd tl|hd Ctl|Cf arg|f Carg|
+    Ccond thenBody elseBody|cond CThen elseBody|cond thenBody CElse].
+  2, 3, 4, 5, 6, 7, 8: simpl in eq; discriminate eq.
   simpl in eq; split; congruence.
 Qed.
 
@@ -207,7 +233,9 @@ Lemma plug_eq_cons :
   (∃ Ctl, C = CConsWTl hd Ctl ∧ Ctl ⋄ t = tl).
 Proof.
   intros E.
-  destruct E as [|Chd tl|hd Ctl|Cf arg|f Carg].
+  destruct E as [|Chd tl|hd Ctl|Cf arg|f Carg|
+    Ccond thenBody elseBody|cond CThen elseBody|cond thenBody CElse].
+  8, 7, 6, 5, 4: intros t hd tl eq; discriminate eq.
   - intros t hd tl eq.
     simpl in eq.
     left.
@@ -225,10 +253,6 @@ Proof.
     simpl in eq.
     injection eq; clear eq; intros eq1 eq2; subst.    
     split; reflexivity.
-  - intros t hd tl eq.
-    discriminate eq.
-  - intros t hd tl eq.
-    discriminate eq.
 Qed.
 
 Lemma plug_eq_abs :
@@ -238,8 +262,9 @@ Lemma plug_eq_abs :
   C = □ ∧ t = Abs body.
 Proof.
   intros E t x eq.
-  destruct E as [|Chd tl|hd Ctl|Cf arg|f Carg].
-  2, 3, 4, 5: simpl in eq; discriminate eq.
+  destruct E as [|Chd tl|hd Ctl|Cf arg|f Carg|
+    Ccond thenBody elseBody|cond CThen elseBody|cond thenBody CElse].
+  2, 3, 4, 5, 6, 7, 8: simpl in eq; discriminate eq.
   simpl in eq; split; congruence.
 Qed.
 
@@ -252,15 +277,13 @@ Lemma plug_eq_app :
   (∃ Carg, C = CAppArg f Carg ∧ Carg ⋄ t = arg).
 Proof.
   intros E.
-  destruct E as [|Chd tl|hd Ctl|Cf arg|f Carg].
+  destruct E as [|Chd tl|hd Ctl|Cf arg|f Carg|
+    Ccond thenBody elseBody|cond CThen elseBody|cond thenBody CElse].
+  2, 3, 6, 7, 8: intros t f arg eq; discriminate eq.
   - intros t hd tl eq.
     simpl in eq.
     left.
     split. 1: reflexivity. assumption.
-  - intros t f arg eq.
-    discriminate eq.
-  - intros t f arg eq.
-    discriminate eq.
   - intros t hd tl' eq.
     simpl in eq.
     injection eq.
@@ -284,6 +307,12 @@ Inductive toplevelStep : Q → Q → Prop :=
   | StepBetaRedex (t u : Q) :
     value u →
     App (Abs t) u →topQ t.[fun x => match x with | 0 => u | _ => Var x end]
+  | StepIfThen (thenBody elseBody : Q) :
+    value elseBody → value thenBody →
+    (Qif (Letter true) Qthen thenBody Qelse elseBody) →topQ thenBody
+  | StepIfElse (thenBody elseBody : Q) :
+    value elseBody → value thenBody →
+    (Qif (Letter false) Qthen thenBody Qelse elseBody) →topQ elseBody
 where "t '→topQ' u" := (toplevelStep t u).
 
 Reserved Notation "t '→Q' u" (at level 90).
@@ -316,7 +345,8 @@ Proof.
   intros t Hval.
   inversion Hval as [ w H | b H | body H ]; intros [u contra].
   all: inversion contra as [E t' u' Hevalctx Hred eq Hredtop eq3]; subst.
-  all: destruct E as [|Chd tl|hd Ctl|Cf arg|f Carg]; simpl in eq3; try discriminate eq3.
+  all: destruct E as [|Chd tl|hd Ctl|Cf arg|f Carg|
+    Ccond thenBody elseBody|cond CThen elseBody|cond thenBody CElse]; simpl in eq3; try discriminate eq3.
   all: subst.
   all: inversion Hredtop.
 Qed.
@@ -324,7 +354,8 @@ Qed.
 Lemma eval_context_value : ∀ (C : QContext) (t : Q),
   ¬ value t → QEvalContext C → ¬ value (C ⋄ t).
 Proof.
-  induction C as [|Chd IH tl|hd Ctl IH|Cf IH arg|f Carg IH];
+  induction C as [|Chd tl|hd Ctl|Cf arg|f Carg|
+    Ccond thenBody elseBody|cond CThen elseBody|cond thenBody CElse];
   intros t Hnotval Hevalctx contra; simpl in contra.
   all: inversion contra; subst.
   all: apply Hnotval; apply contra.
@@ -341,17 +372,17 @@ Lemma typed_value : ∀ (t : Q) (τ : Qtype),
 Proof.
   intros t τ Htyp Hval.
   inversion Hval as [w|b|body]; subst.
-  - inversion Htyp as [| Γ w' eq | | | |]; subst.
+  - inversion Htyp as [| Γ w' eq | | | | |]; subst.
     right; left.
     split.
     1: reflexivity.
     exists w. reflexivity.
-  - inversion Htyp as [| | Γ b' eq | | |]; subst.
+  - inversion Htyp as [| | Γ b' eq | | | |]; subst.
     left.
     split.
     1: reflexivity.
     exists b. reflexivity.
-  - inversion Htyp as [| | | | Γ α β body' Htypbody eq1 eq2 eq3 | ]; subst.
+  - inversion Htyp as [| | | | Γ α β body' Htypbody eq1 eq2 eq3 | |]; subst.
     right; right.
     split.
     1: exists α, β; reflexivity.
@@ -370,7 +401,8 @@ Proof.
     Γ' b|
     hd tl Γ' Htyphd IHhd Htyptl IHtl|
     Γ' α β body Htypbody IH|
-    Γ' α β f arg Htypf IHf Htyparg IHarg].
+    Γ' α β f arg Htypf IHf Htyparg IHarg|
+    Γ' α cond thenBody elseBody Htypcond IHcond Htypthen IHthen Htypelse IHelse].
   2, 3, 5: right; constructor.
   - subst.
     discriminate eqtyp.
@@ -432,6 +464,7 @@ Proof.
       * apply Htopred.
       * simpl; reflexivity.
       * simpl; reflexivity.
+    (* toplevel reduction *)
     + specialize (typed_value f (α →T β) Htypf Hfval) as [
       [contra _]|[
       [contra _]|
@@ -454,6 +487,45 @@ Proof.
       }
       * constructor.
       * constructor. assumption.
+  - subst. left.
+    destruct IHcond as [[cond' Hcondred] | Hcondval].
+    3: destruct IHthen as [[thenBody' Hthenred]|Hvalthen].
+    5: destruct IHelse as [[elseBody' Helsered]|Hvalelse].
+    1, 3, 5: reflexivity.
+    + exists (Qif cond' Qthen thenBody Qelse elseBody).
+      inversion Hcondred as [Econd t u t' u' Heval' Htopred eq1 eq2 eq3 eq4]; subst.
+      eapply (StepCtx (CIfCond Econd thenBody elseBody)).
+      * constructor. assumption.
+      * apply Htopred.
+      * simpl.
+        reflexivity.
+      * simpl. reflexivity.
+    + exists (Qif cond Qthen thenBody' Qelse elseBody).
+      inversion Hthenred as [Ethen t u t' u' Heval' Htopred eq1 eq2 eq3 eq4]; subst.
+      eapply (StepCtx (CIfThen cond Ethen elseBody)).
+      * constructor; assumption.
+      * apply Htopred.
+      * simpl.
+        reflexivity.
+      * simpl. reflexivity.
+    + exists (Qif cond Qthen thenBody Qelse elseBody').
+      inversion Helsered as [Eelse t u t' u' Heval' Htopred eq1 eq2 eq3 eq4]; subst.
+      eapply (StepCtx (CIfElse cond thenBody Eelse)).
+      * constructor; assumption.
+      * apply Htopred.
+      * simpl.
+        reflexivity.
+      * simpl. reflexivity.
+    (* toplevel reduction *)
+    + specialize (typed_value cond _ Htypcond Hcondval) as [
+      [eq [[|] eq']]|[
+      [contra _]|
+      [[α' [β' contra]] _]
+      ]]; subst;
+      [eexists; apply step_toplevel_step; constructor; assumption |
+       eexists; apply step_toplevel_step; constructor; assumption |
+       discriminate contra |
+       discriminate contra].
 Qed.
 
 (* Note: restricting the following lemma to evaluation contexts ensures
@@ -473,8 +545,14 @@ Proof.
   generalize dependent Γ.
   generalize dependent t.
   generalize dependent τ.
-  induction Heval as [|Chd tl Heval' IHhd|hd Ctl Hvalhd Heval' IHtl|
-    Cf arg Heval' IHf|f Carg Hvalf Heval' IHarg];
+  induction Heval as [|
+    Chd tl Heval' IHhd|
+    hd Ctl Hvalhd Heval' IHtl|
+    Cf arg Heval' IHf|
+    f Carg Hvalf Heval' IHarg|
+    Ccond thenBody elseBody Heval' IHcond|
+    cond Cthen elseBody Hvalcond Heval' IHthen|
+    cond thenBody Celse Hvalcond Hvalthen Heval' IHelse];
   intros τ t Γ Htyp.
   - simpl in Htyp. exists τ.
     split.
@@ -483,7 +561,7 @@ Proof.
       simpl.
       apply Htyp'.
   - simpl in Htyp.
-    inversion Htyp as [| | | hd' tl' Γ' Htyphd Htyptl eq2 eq3 eq4 | |]; subst.
+    inversion Htyp as [| | | hd' tl' Γ' Htyphd Htyptl eq2 eq3 eq4 | | |]; subst.
     specialize (IHhd _ _ _ Htyphd) as [τ' [Htypt Hgen]].
     exists τ'.
     split.
@@ -494,7 +572,7 @@ Proof.
       * apply Hgen. assumption.
       * assumption.
   - simpl in Htyp.
-    inversion Htyp as [| | | hd' tl' Γ' Htyphd Htyptl eq2 eq3 eq4 | |]; subst.
+    inversion Htyp as [| | | hd' tl' Γ' Htyphd Htyptl eq2 eq3 eq4 | | |]; subst.
     specialize (IHtl _ _ _ Htyptl) as [τ' [Htypt Hgen]].
     exists τ'.
     split.
@@ -506,7 +584,7 @@ Proof.
       * apply Hgen.
         assumption.
   - simpl in Htyp.
-    inversion Htyp as [| | | | | Γ' α β f' arg' Htypf Htyparg eq2 eq3 eq4]; subst.
+    inversion Htyp as [| | | | | Γ' α β f' arg' Htypf Htyparg eq2 eq3 eq4 |]; subst.
     specialize (IHf _ _ _ Htypf) as [τ' [Htypt Hgen]].
     exists τ'.
     split.
@@ -518,7 +596,7 @@ Proof.
         assumption.
       * assumption.
   - simpl in Htyp.
-    inversion Htyp as [| | | | | Γ' α β f' arg' Htypf Htyparg eq2 eq3 eq4]; subst.
+    inversion Htyp as [| | | | | Γ' α β f' arg' Htypf Htyparg eq2 eq3 eq4 |]; subst.
     specialize (IHarg _ _ _ Htyparg) as [τ' [Htypt Hgen]].
     exists τ'.
     split.
@@ -529,9 +607,37 @@ Proof.
       * apply Htypf.
       * apply Hgen.
         assumption.
+  - simpl in Htyp.
+    inversion Htyp as [| | | | | |
+    Γ' α cond' thenBody' elseBody' Htypcond' Htypthen' Htypelse' eq2 eq3 eq4]
+    ; subst.
+    specialize (IHcond TLetter t Γ Htypcond') as [τ' [Htyp' Hgen]].
+    exists τ'.
+    split; [assumption|].
+    intros t' Htyp''.
+    simpl.
+    constructor; [apply Hgen; assumption | assumption | assumption].
+  - simpl in Htyp.
+    inversion Htyp as [| | | | | |
+    Γ' α cond' thenBody' elseBody' Htypcond' Htypthen' Htypelse' eq2 eq3 eq4]
+    ; subst.
+    specialize (IHthen τ t Γ Htypthen') as [τ' [Htyp' Hgen]].
+    exists τ'.
+    split; [assumption|].
+    intros t' Htyp''.
+    simpl.
+    constructor; [ assumption | apply Hgen;assumption | assumption].
+  - simpl in Htyp.
+    inversion Htyp as [| | | | | |
+    Γ' α cond' thenBody' elseBody' Htypcond' Htypthen' Htypelse' eq2 eq3 eq4]
+    ; subst.
+    specialize (IHelse τ t Γ Htypelse') as [τ' [Htyp' Hgen]].
+    exists τ'.
+    split; [assumption|].
+    intros t' Htyp''.
+    simpl.
+    constructor; [assumption | assumption | apply Hgen; assumption].    
 Qed.
-
-Print Q.
 
 Fixpoint list_out_abs (l : list var) : list var :=
   match l with
@@ -567,6 +673,8 @@ Fixpoint freevars (t : Q) : list var := match t with
   | ConsW hd tl => freevars hd ++ freevars tl
   | App f arg => freevars f ++ freevars arg
   | Abs body => list_out_abs (freevars body)
+  | Qif cond Qthen thenBody Qelse elseBody =>
+    freevars cond ++ freevars thenBody ++ freevars elseBody 
   end.
 
 Definition ground : Q → Prop := λ t, freevars t = [].
@@ -581,7 +689,8 @@ Proof.
     Ξ b |
     t1 t2 Ξ Ht1 IHt1 Ht2 IHt2 |
     Ξ α β body Hbody IHbody |
-    Ξ α β t1 t2 Ht1 IHt1 Ht2 IHt2
+    Ξ α β t1 t2 Ht1 IHt1 Ht2 IHt2|
+    Ξ α cond thenBody elseBody Hcond IHcond Hthen IHthen Helse IHelse
   ]; intros x HIn.
   2, 3: exfalso; apply HIn.
   2, 4:
@@ -604,6 +713,15 @@ Proof.
     + specialize (IHbody (S (S x)) HIn).
       unfold typenv_enter_abs in IHbody.
       assumption.
+  - simpl in HIn.
+    apply in_app_or in HIn as [HIn1 | HIn]; [
+      apply IHcond ; assumption |
+      apply in_app_or in HIn as [HIn2 | HIn3];
+      [
+        apply IHthen; assumption |
+        apply IHelse; assumption
+      ]
+    ].
 Qed.
 
 Lemma typed_emptyenv_ground : ∀ (t : Q) (τ : Qtype), t∅ ⊢ t ⦙ τ → ground t.
@@ -629,7 +747,8 @@ Proof.
     b|
     t1 IH1 t2 IH2|
     body IHbody|
-    t1 IH1 t2 IH2
+    t1 IH1 t2 IH2|
+    t1 IH1 t2 IH2 t3 IH3
   ]; intros σ Hfv.
   2, 3: reflexivity.
   2, 4: simpl;
@@ -661,6 +780,21 @@ Proof.
       * simpl. reflexivity.
       * simpl. clear -HIn.
         apply In_list_out_abs. assumption.
+  - simpl.
+    rewrite IH1, IH2, IH3.
+    1: reflexivity.
+    + intros x Hvars.
+      apply Hfv.
+      simpl.
+      apply in_or_app; right; apply in_or_app; right; assumption.
+    + intros x Hvars.
+      apply Hfv.
+      simpl.
+      apply in_or_app; right; apply in_or_app; left; assumption.
+    + intros x Hvars.
+      apply Hfv.
+      simpl.
+      apply in_or_app; left; assumption.
 Qed.
 
 Lemma ground_subst_eq : ∀ (t : Q) (σ : var → Q), ground t → t.[σ] = t.
@@ -685,10 +819,14 @@ Proof.
     Γ b |
     t1 t2 Γ Ht1 IHt1 Ht2 IHt2 |
     Γ α β body Hbody IHbody |
-    Γ α β t1 t2 Ht1 IHt1 Ht2 IHt2
+    Γ α β t1 t2 Ht1 IHt1 Ht2 IHt2|
+    Γ α cond thenBody elseBody Hcond IHcond Hthen IHthen Helse IHelse
   ]; intros Γ' Hextends.
-  4, 6: econstructor; [apply IHt1 | apply IHt2]; assumption.
+  (* direct base cases *)
   2, 3: constructor.
+  (* straightforward IH application *)
+  2, 4: econstructor; [apply IHt1 | apply IHt2]; assumption.
+  3: econstructor; [apply IHcond | apply IHthen | apply IHelse]; assumption.
   - constructor. apply Hextends. assumption.
   - constructor.
     apply IHbody.
@@ -722,8 +860,10 @@ Proof.
     Ξ b |
     t1 t2 Ξ Ht1 IHt1 Ht2 IHt2 |
     Ξ α β body Hbody IHbody |
-    Ξ α β t1 t2 Ht1 IHt1 Ht2 IHt2
+    Ξ α β t1 t2 Ht1 IHt1 Ht2 IHt2|
+    Ξ α cond thenBody elseBody Hcond IHcond Hthen IHthen Helse IHelse
   ]; intros σ x v [Hσx Hσ] τx Γ [HΞx HΓs] Hval Htypv.
+  (* straightforward IH application *)
   4, 6: simpl; econstructor; [
     eapply IHt1; [ split; [apply Hσx | assumption] |
       split; [apply HΞx | assumption ] |
@@ -737,6 +877,34 @@ Proof.
       assumption
     ]
   ].
+  5: { (* TODO minimize *)
+    simpl. econstructor; [eapply IHcond | eapply IHthen | eapply IHelse ].
+    - split.
+      + apply Hσx.
+      + assumption.
+    - split.
+      + apply HΞx.
+      + assumption.
+    - assumption.
+    - assumption.
+    - split.
+      + apply Hσx.
+      + assumption.
+    - split.
+      + apply HΞx.
+      + assumption.
+    - assumption.
+    - assumption.
+    - split.
+      + apply Hσx.
+      + assumption.
+    - split.
+      + apply HΞx.
+      + assumption.
+    - assumption.
+    - assumption.
+  }
+  (* rest *)
   - destruct (x =? y) eqn:eqyx.
     + apply PeanoNat.Nat.eqb_eq in eqyx.
       subst.
@@ -816,11 +984,12 @@ Proof.
   2: assumption.
   apply Hgen.
   clear Heval Hred Hgen E.
-  inversion Htopred as [b w eq1 eq2|body arg Hval eq2 eq3]; subst.
+  inversion Htopred as [b w eq1 eq2|body arg Hval eq2 eq3|
+  cond thenBody elseBody Hval eq2| cond thenBody elseBody Hval eq2]; subst.
   - inversion Htyps'; subst.
     constructor.
-  - inversion Htyps' as [| | | | |Γ' α β body' arg' Htypf Htyparg eq1 eq2]; subst.
-    inversion Htypf as [| | | |Γ' α' β' body' Htypbody eq1 eq2 |]; subst.
+  - inversion Htyps' as [| | | | |Γ' α β body' arg' Htypf Htyparg eq1 eq2| ]; subst.
+    inversion Htypf as [| | | |Γ' α' β' body' Htypbody eq1 eq2 | |]; subst.
     eapply typing_substitution.
     4: apply Hval.
     4: apply Htyparg.
@@ -835,346 +1004,10 @@ Proof.
       intros y neqy0.
       destruct y as [|y]. 1: exfalso; apply neqy0; reflexivity.
       reflexivity.
+  - inversion Htyps' as [| | | | | |
+    Γ' α cond' thenBody' elseBody' Htypcond' Htypthen' Htypelse' eq2 eq3 eq4]; subst.
+    assumption.
+  - inversion Htyps' as [| | | | | |
+    Γ' α cond' thenBody' elseBody' Htypcond' Htypthen' Htypelse' eq2 eq3 eq4]; subst.
+    assumption.
 Qed.
-
-(** Functions to compute steps *)
-
-Definition compute_toplevel_step (term : Q) : option Q :=
-  match term with
-  | ConsW (Letter b) (Word w) =>
-    Some (Word (b :: w))
-  | App (Abs body) arg =>
-    if is_value arg then
-      Some (body.[fun x => match x with | 0 => arg | _ => Var x end])
-    else
-      None
-  | _ => None
-  end.
-
-Definition compute_toplevel_step_refl : ∀ (t u : Q),
-  (t →topQ u) ↔ compute_toplevel_step t = Some u.
-Proof.
-  intros t u.
-  split.
-  - destruct t as
-    [x | w | b | hd tl | body | f arg]; intro Hred; inversion Hred as [b' w' eq1 eq2| body' eq Hval]; subst.
-    + simpl. reflexivity.
-    + simpl.
-      specialize (reflect_iff _ _ (is_value_refl arg)) as Hrefl.
-      rewrite Hrefl in Hval.
-      rewrite Hval.
-      reflexivity.
-  - intro H.
-    destruct t as
-    [x | w | b | hd tl | body | f arg]; simpl in H; try discriminate H.
-    + destruct hd as [x' | w' | b' | hd' tl' | body' | f' arg'];
-      try discriminate H.
-      destruct tl as [x'' | w'' | b'' | hd'' tl'' | body'' | f'' arg''];
-      try discriminate H.
-      injection H; clear H; intro eq; subst.
-      constructor.
-    + destruct f as [x' | w' | b' | hd' tl' | body' | f' arg'];
-      try discriminate H.
-      destruct (is_value arg) eqn:Hisval;
-      specialize (reflect_iff _ _ (is_value_refl arg)) as Hrefl.
-      * rewrite <- Hrefl in Hisval.
-        injection H; clear H; intro eq; subst.
-        constructor.
-        assumption.
-      * discriminate H.
-Qed.
-
-Definition letter_value (b : bool) : value (Letter b).
-specialize (reflect_iff _ _ (is_value_refl (Letter b))) as Hrefl.
-rewrite Hrefl. simpl. reflexivity.
-Defined.
-
-Definition word_value (w : list bool) : value (Word w).
-specialize (reflect_iff _ _ (is_value_refl (Word w))) as Hrefl.
-rewrite Hrefl. simpl. reflexivity.
-Defined.
-
-Definition abs_value (body : {bind Q}) : value (Abs body).
-specialize (reflect_iff _ _ (is_value_refl (Abs body))) as Hrefl.
-rewrite Hrefl. simpl. reflexivity.
-Defined.
-
-Fixpoint compute_eval_env (term : Q) : option (QContext * Q)%type :=
-  match term with
-  | ConsW hd tl =>
-    if is_value hd then
-      if is_value tl then
-        match hd, tl with
-        | Letter b, Word w => Some (□, ConsW (Letter b) (Word w))
-        | _, _ => None
-        end
-      else
-        match compute_eval_env tl with
-        | None => None
-        | Some (Ctl, redex) => Some (CConsWTl hd Ctl, redex)
-        end
-    else
-      match compute_eval_env hd with
-      | None => None
-      | Some (Chd, redex) => Some (CConsWHd Chd tl, redex)
-      end
-  | App f arg =>
-    if is_value f then
-      if is_value arg then
-        match f with
-        | Abs body => Some (□, App (Abs body) arg)
-        | _ => None
-        end
-      else
-        match compute_eval_env arg with
-        | None => None
-        | Some (Carg, redex) => Some (CAppArg f Carg, redex)
-        end
-    else
-      match compute_eval_env f with
-      | None => None
-      | Some (Cf, redex) => Some (CAppF Cf arg, redex) 
-      end
-  | _ => None
-  end
-.
-
-Definition compute_step (term : Q) : option Q :=
-  match compute_eval_env term with
-  | None => None
-  | Some (E, redex) =>
-    match compute_toplevel_step redex with
-    | None => None
-    | Some reduced => Some (E ⋄ reduced)
-    end
-  end.
-
-Lemma compute_eval_env_spec : ∀ (E : QContext) (t t' : Q),
-  compute_eval_env t = Some (E, t') ↔ QEvalContext E ∧ t = E ⋄ t' ∧ (∃ u', t' →topQ u').
-Proof.
-  intros E t t'.
-  split.
-  - induction t as [x|b|w|hd IHhd tl IHtl|body IH|f IHf arg IHarg] in E, t' |- *;
-    intro H.
-    1, 2, 3, 5: simpl in H; discriminate H.
-    + simpl in H.
-      destruct (is_value hd) eqn:eqisvalhd.
-      * destruct (is_value tl) eqn:eqisvaltl.
-        -- destruct hd as [xhd|whd|bhd|hdhd tlhd|bodyhd|fhd arghd];
-          try discriminate H.
-          destruct tl as [xtl|wtl|btl|hdtl tltl|bodytl|ftl argtl];
-          try discriminate H.
-          injection H; intros eq1 eq2; subst.
-          repeat split.
-          ++ constructor.
-          ++ exists (Word (bhd :: wtl)).
-            constructor.
-        -- destruct (compute_eval_env tl) as [[Etl redextl]|] eqn:eqEtl.
-          ++ injection H; intros eq1 eq2; subst.
-            specialize (IHtl Etl t').
-            destruct IHtl as [IHtl1 [IHtl2 IHtl3]].
-            1: reflexivity.
-            repeat split.
-            ** constructor.
-              --- apply (reflect_iff _ _ (is_value_refl hd)).
-                assumption.
-              --- assumption.
-            ** simpl. f_equal.
-              assumption.
-            ** assumption.
-          ++ discriminate H.
-      * destruct (compute_eval_env hd) as [[Ehd redexhd]|].
-        2: discriminate H.
-        injection H; intros eq1 eq2; subst; clear H.
-        specialize (IHhd Ehd t') as [IHhd1 [IHhd2 IHhd3]].
-        1: reflexivity.
-        subst.
-        repeat split.
-        -- constructor. assumption.
-        -- assumption.
-    + simpl in H.
-      destruct (is_value f) eqn:eqisvalf.
-      * destruct (is_value arg) eqn:eqisvalarg.
-        -- destruct f as [xf|wf|bf|hdf tlf|bodyf|ff argf];
-          try discriminate H.
-          injection H; intros eq1 eq2; subst.
-          repeat split.
-          ++ constructor.
-          ++ eexists.
-            constructor.
-            apply (reflect_iff _ _ (is_value_refl arg)).
-            assumption.
-        -- destruct (compute_eval_env arg) as [[Earg redexarg]|] eqn:eqEarg.
-          ++ injection H; intros eq1 eq2; subst.
-            specialize (IHarg Earg t').
-            destruct IHarg as [IHarg1 [IHarg2 IHarg3]].
-            1: reflexivity.
-            repeat split.
-            ** constructor.
-              --- apply (reflect_iff _ _ (is_value_refl f)).
-                assumption.
-              --- assumption.
-            ** simpl. f_equal.
-              assumption.
-            ** assumption.
-          ++ discriminate H.
-      * destruct (compute_eval_env f) as [[Ef redexf]|].
-        2: discriminate H.
-        injection H; intros eq1 eq2; subst; clear H.
-        specialize (IHf Ef t') as [IHf1 [IHf2 IHf3]].
-        1: reflexivity.
-        subst.
-        repeat split.
-        -- constructor. assumption.
-        -- assumption.
-  - induction E as [|Chd IH tl|hd Ctl IH|Cf IH arg|f Carg IH]
-      in t, t' |-*;  intros [Heval [eq [u' Htopred]]]; subst.
-    + simpl.
-      inversion Htopred as [b w eq1 eq2|f arg Hvalue eq]; subst.
-      * simpl.
-        reflexivity.
-      * simpl.
-        rewrite (reflect_iff _ _ (is_value_refl arg)) in Hvalue.
-        rewrite Hvalue.
-        reflexivity.
-    + inversion Heval as [ |G0 G1 Hevalhd | | |]; subst.
-      specialize (IH (Chd ⋄ t') t').
-      simpl.
-      rewrite IH.
-      * destruct (Chd ⋄ t') eqn:eqt;
-          try reflexivity;
-          try (simpl in IH; discriminate IH).
-        all: (repeat split; try reflexivity; try assumption).
-        all: exists u'; assumption.
-      * repeat split. 1: assumption.
-        exists u'. assumption.
-    + inversion Heval as [ | |hd' Ctl' Hval Heval' eq | |]; subst.
-      specialize (IH (Ctl ⋄ t') t').
-      simpl.
-      rewrite IH.
-      * assert (Hisvalhd : is_value hd = true).
-        {
-          rewrite <- (reflect_iff _ _ (is_value_refl _)).
-          assumption.
-        }
-        rewrite Hisvalhd.
-        assert (HnotisvalCtl : is_value (Ctl ⋄ t') = false).
-        {
-          destruct (is_value (Ctl ⋄ t')) eqn:eqisvalC.
-          + exfalso.
-            eapply eval_context_value.
-            2: apply Heval'.
-            2: apply (reflect_iff _ _ (is_value_refl _)).
-            2: apply eqisvalC.
-            intro Hvalt'.
-            eapply value_normal.
-            * apply Hvalt'.
-            * exists u'.
-              apply step_toplevel_step.
-              assumption.
-          + reflexivity.
-        }
-        rewrite HnotisvalCtl.
-        reflexivity.
-      * repeat split.
-        1: assumption.
-        exists u'; assumption.
-    + inversion Heval as [ | | | Cf' arg' Heval' eq1 | ]; subst.
-      simpl.
-      rewrite (IH (Cf ⋄ t') t').
-      * destruct Cf as [| Chd' tl' | hd' Ctl' | Cf' arg' | f' Carg' ];
-        simpl; try reflexivity.
-        destruct t' as [x|w|b|hd tl|body|f'' arg''] eqn:eqt'; try reflexivity.
-        all: exfalso.
-        all: apply (value_normal t').
-        all: try (rewrite eqt'; constructor).
-        all: exists u'; rewrite eqt'; apply step_toplevel_step; assumption.
-      * repeat split.
-        -- assumption.
-        -- exists u'.
-          assumption.
-    + inversion Heval as [ | | | | f' Carg' Hvalue Heval' eq]; subst.
-      simpl.
-      rewrite (IH (Carg ⋄ t') t').
-      * assert (Hisvalf : is_value f = true).
-        {
-          rewrite <- (reflect_iff _ _ (is_value_refl _)).
-          assumption.
-        }
-        rewrite Hisvalf.
-        assert (HnotisvalCarg : is_value (Carg ⋄ t') = false).
-        {
-          destruct (is_value (Carg ⋄ t')) eqn:eqisvalC.
-          + exfalso.
-            eapply eval_context_value.
-            2: apply Heval'.
-            2: apply (reflect_iff _ _ (is_value_refl _)).
-            2: apply eqisvalC.
-            intro Hvalt'.
-            eapply value_normal.
-            * apply Hvalt'.
-            * exists u'.
-              apply step_toplevel_step.
-              assumption.
-          + reflexivity.
-        }
-        rewrite HnotisvalCarg.
-        reflexivity.
-      * repeat split.
-        -- assumption.
-        -- exists u'.
-          assumption.
-Qed.
-
-
-Definition compute_step_refl : ∀ (t u : Q),
-  (t →Q u) ↔ compute_step t = Some u.
-Proof.
-  intros t u.
-  split.
-  - intro Hred.
-    inversion Hred as [E t0 u0 t' u' Heval Hredtop eq1 eq2]; subst.
-    specialize (compute_eval_env_spec E (E ⋄ t') t') as [_ Heval_env].
-    unfold compute_step.
-    rewrite Heval_env.
-    2: {
-      repeat split. 1: assumption.
-      exists u'.
-      assumption.
-    }
-    specialize (compute_toplevel_step_refl t' u') as [Hcompute_toplevel _].
-    apply Hcompute_toplevel in Hredtop as eq_compute_toplevel.
-    rewrite eq_compute_toplevel.
-    reflexivity.
-  - intro H.
-    destruct (compute_eval_env t) eqn:eq_evalenv_t.
-    + destruct p as [E t'].
-      unfold compute_step in H.
-      rewrite eq_evalenv_t in H.
-      apply compute_eval_env_spec in eq_evalenv_t as [Heval [eq [u' Hredtop]]]; subst.
-      apply (compute_toplevel_step_refl t' u') in Hredtop as eq_toplevel_step.
-      rewrite eq_toplevel_step in H.
-      injection H; clear H; intro H; subst.
-      econstructor.
-      * apply Heval.
-      * apply Hredtop.
-      * reflexivity.
-      * reflexivity.
-    + unfold compute_step in H.
-      rewrite eq_evalenv_t in H.
-      discriminate H.
-Qed.   
-
-Fixpoint compute_fuel (term : Q) (fuel : nat) : Q :=
-  match fuel with
-  | 0 => term
-  | S fuel' => 
-    match compute_step term with
-    | None => term
-    | Some term' => compute_fuel term' fuel'
-    end
-  end.
-
-Definition IdLetter := Abs (Var 0).
-
-(* Compute (compute_fuel <{ IdLetter IdLetter IdLetter }> 3). *)
